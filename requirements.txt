@@ -1,0 +1,5 @@
+txjson-rpc
+bitcoin
+u-msgpack-python
+service_identity
+protobuf

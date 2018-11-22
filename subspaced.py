@@ -1,13 +1,16 @@
 import pickle
+import socket
+import codecs
 
-from config import Config
+from ConfigParser import SafeConfigParser
 from os.path import expanduser
 from OpenSSL import SSL
 from txjsonrpc.netstring import jsonrpc
+from binascii import unhexlify
 
 from twisted.application import service, internet
 from twisted.python.log import ILogObserver
-from twisted.internet import ssl, task
+from twisted.internet import ssl, task, reactor
 from twisted.web import resource, server
 from twisted.web.resource import NoResource
 
@@ -15,19 +18,32 @@ from subspace.network import Server
 from subspace import log
 from subspace.message import *
 
-
+version = 20000
 
 sys.path.append(os.path.dirname(__file__))
 
 datafolder = expanduser("~") + "/.subspace/"
 
-f = file(datafolder + 'subspace.conf')
-cfg = Config(f)
+cfg = SafeConfigParser()
+with codecs.open(datafolder + 'subspace.conf', 'r', encoding='utf-8') as f:
+    cfg.readfp(f)
 
-username = cfg.rpcusername if "rpcusername" in cfg else "Username"
-password = cfg.rpcpassword if "rpcpassword" in cfg else "Password"
-bootstrap_node = cfg.bootstrapnode if "bootstrapnode" in cfg else "1.2.3.4"
-bootstrap_port = cfg.bootstrapport if "bootstrapport" in cfg else "8335"
+bootstrap = cfg.items("bootstrap")
+bootstrap_list = []
+for node in bootstrap:
+    try:
+        socket.inet_aton(node[0])
+        tup = (str(node[0]), int(node[1]))
+    except socket.error:
+        ip = str(socket.gethostbyname(node[0]))
+        tup = (ip, int(node[1]))
+    bootstrap_list.append(tup)
+
+ssl_seeds = cfg.items("seeds")
+seed_list = []
+for seed in ssl_seeds:
+    s = str(seed[0]) + ":" + str(seed[1])
+    seed_list.append(s)
 
 if os.path.isfile(datafolder + 'keys.pickle'):
     privkey = pickle.load(open(datafolder + "keys.pickle", "rb"))
@@ -41,13 +57,33 @@ application = service.Application("subspace")
 application.setComponent(ILogObserver, log.FileLogObserver(sys.stdout, log.INFO).emit)
 
 if os.path.isfile('cache.pickle'):
-    kserver = Server.loadState('cache.pickle')
+    kserver = Server.loadState('cache.pickle', bootstrap_list, seed_list)
 else:
-    kserver = Server()
-    kserver.bootstrap([(bootstrap_node, bootstrap_port)])
+    kserver = Server(id=unhexlify(pubkey[2:66]))
+    kserver.bootstrap(bootstrap_list, seed_list)
 kserver.saveStateRegularly('cache.pickle', 10)
-udpserver = internet.UDPServer(cfg.port if "port" in cfg else 8335, kserver.protocol)
+udpserver = internet.UDPServer(cfg.get("SUBSPACED", "port") if cfg.has_option("SUBSPACED", "port") else 8335, kserver.protocol)
 udpserver.setServiceParent(application)
+
+class MessageListener():
+
+    def __init__(self):
+        self.encrypted = {}
+        self.new_messages = []
+        loopingCall = task.LoopingCall(self.attempt_decrypt)
+        loopingCall.start(30, True)
+
+    def notify(self, key, value):
+        v = ["", value]
+        self.encrypted[key] = v
+
+    def attempt_decrypt(self):
+        self.new_messages.extend(MessageDecoder(privkey, self.encrypted).get_messages())
+        self.encrypted.clear()
+
+
+listener = MessageListener()
+kserver.protocol.addMessageListener(listener)
 
 class ChainedOpenSSLContextFactory(ssl.DefaultOpenSSLContextFactory):
     def __init__(self, privateKeyFileName, certificateChainFileName,
@@ -68,7 +104,7 @@ class ChainedOpenSSLContextFactory(ssl.DefaultOpenSSLContextFactory):
         ctx.use_privatekey_file(self.privateKeyFileName)
         self._context = ctx
 
-# Web-Server
+# Http-Server
 class WebResource(resource.Resource):
     def __init__(self, kserver):
         resource.Resource.__init__(self)
@@ -113,21 +149,34 @@ class WebResource(resource.Resource):
         Processes the delayed requests that did not have
         any data to return last time around.
         """
+        #TODO
 
-if "server" in cfg:
+if cfg.has_option("SUBSPACED", "server"):
     server_protocol = server.Site(WebResource(kserver))
-    if "useSSL" in cfg:
-        webserver = internet.SSLServer(cfg.serverport if "serverport" in cfg else 8080,
+    if cfg.has_option("SUBSPACED", "useSSL"):
+        httpserver = internet.SSLServer(cfg.get("SUBSPACED", "serverport") if cfg.has_option("SUBSPACED", "serverport") else 8080,
                                    server_protocol,
-                                   ChainedOpenSSLContextFactory(cfg.sslkey, cfg.sslcert))
-        #webserver = internet.SSLServer(8335, website, ssl.DefaultOpenSSLContextFactory(options["sslkey"], options["sslcert"]))
+                                   ChainedOpenSSLContextFactory(cfg.get("SUBSPACED", "sslkey"), cfg.get("SUBSPACED", "sslcert")))
+        #httpserver = internet.SSLServer(8335, website, ssl.DefaultOpenSSLContextFactory(cfg.get("SUBSPACED", "sslkey"), cfg.get("SUBSPACED", "sslcert")))
     else:
-        webserver = internet.TCPServer(cfg.serverport if "serverport" in cfg else 8080, server_protocol)
-    webserver.setServiceParent(application)
+        httpserver = internet.TCPServer(cfg.get("SUBSPACED", "serverport") if cfg.has_option("SUBSPACED", "serverport") else 8080, server_protocol)
+    httpserver.setServiceParent(application)
 
 # RPC-Server
 class RPCCalls(jsonrpc.JSONRPC):
-    """An example object to be published."""
+
+    def jsonrpc_getinfo(self):
+        info = {}
+        info["version"] = version
+        num_peers = 0
+        for bucket in kserver.protocol.router.buckets:
+            num_peers += bucket.__len__()
+        info["known peers"] = num_peers
+        info["stored messages"] = len(kserver.storage.data)
+        size = sys.getsizeof(kserver.storage.data)
+        size += sum(map(sys.getsizeof, kserver.storage.data.itervalues())) + sum(map(sys.getsizeof, kserver.storage.data.iterkeys()))
+        info["db size"] = size
+        return info
 
     def jsonrpc_getpubkey(self):
         return pubkey
@@ -136,25 +185,31 @@ class RPCCalls(jsonrpc.JSONRPC):
         return privkey
 
     def jsonrpc_getmessages(self):
-        return MessageDecoder(privkey, kserver).getMessages()
+        return MessageDecoder(privkey, kserver.storage.get_all()).get_messages()
 
-    def jsonrpc_send(self, pubkey, message):
+    def jsonrpc_getnew(self):
+        listener.attempt_decrypt()
+        messages = listener.new_messages
+        listener.new_messages = []
+        return messages
+
+    def jsonrpc_send(self, pubkey, message, store=True):
+        if type(message) is list:
+            message = " ".join(message)
         r = kserver.getRange()
         if r is False:
             return "Counldn't find any peers. Maybe check your internet connection?"
         else:
-            blocks = MessageEncoder(pubkey, privkey, message, r).getblocks()
-            items = blocks.items()
-            random.shuffle(items)
-            for key, value in items:
+            messages = MessageEncoder(pubkey, privkey, message, r).create_messages()
+            for key, value in messages.items():
                 log.msg("Setting %s = %s" % (key, value))
-                kserver.set(key, value)
+                if store:
+                    kserver.send(unhexlify(key), value)
+                else:
+                    kserver.send(unhexlify(key), value, False)
             return "Message sent successfully"
 
 factory = jsonrpc.RPCFactory(RPCCalls)
-
 factory.addIntrospection()
-
-jsonrpcServer = internet.TCPServer(7080, factory, interface='127.0.0.1')
+jsonrpcServer = internet.TCPServer(8334, factory, interface=cfg.get("SUBSPACED", "rpcallowip") if cfg.has_option("SUBSPACED", "rpcallowip") else "127.0.0.1")
 jsonrpcServer.setServiceParent(application)
-

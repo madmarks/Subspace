@@ -1,9 +1,15 @@
 """
 Package for interacting on the network at a high level.
 """
-import random
+
 import pickle
 import string
+import httplib
+import gzip
+
+from binascii import unhexlify
+
+from cStringIO import StringIO
 
 from twisted.internet.task import LoopingCall
 from twisted.internet import defer, reactor, task
@@ -15,7 +21,10 @@ from subspace.storage import ForgetfulStorage
 from subspace.node import Node
 from subspace.crawling import ValueSpiderCrawl
 from subspace.crawling import NodeSpiderCrawl
-from subspace.node import NodeHeap
+
+from servers.seedserver import peerseeds
+
+from bitcoin import *
 
 
 class Server(object):
@@ -38,7 +47,7 @@ class Server(object):
         self.alpha = alpha
         self.log = Logger(system=self)
         self.storage = storage or ForgetfulStorage()
-        self.node = Node(id or digest(random.getrandbits(255)))
+        self.node = Node(id or unhexlify(random_key()))
         self.protocol = SubspaceProtocol(self.node, self.storage, ksize)
         self.refreshLoop = LoopingCall(self.refreshTable).start(3600)
 
@@ -73,6 +82,30 @@ class Server(object):
 
         return defer.gatherResults(ds).addCallback(republishKeys)
 
+    def querySeed(self, seed):
+        def query(seed):
+            nodes = []
+            c = httplib.HTTPSConnection(seed)
+            c.request("GET", "/")
+            response = c.getresponse()
+            self.log.debug("Https response from %s: %s, %s" % (seed, response.status, response.reason))
+            data = response.read()
+            inbuffer = StringIO(data)
+            f = gzip.GzipFile(mode='rb', fileobj=inbuffer)
+            try:
+                reread_data = f.read(len(data))
+            finally:
+                f.close()
+            seeds = peerseeds.PeerSeeds()
+            seeds.ParseFromString(reread_data)
+            for seed in seeds.seed:
+                tup = (str(seed.ip_address), seed.port)
+                nodes.append(tup)
+            return nodes
+        d = defer.Deferred()
+        reactor.callLater(0, d.callback, query(seed))
+        return d
+
     def bootstrappableNeighbors(self):
         """
         Get a :class:`list` of (ip, port) :class:`tuple` pairs suitable for use as an argument
@@ -86,30 +119,50 @@ class Server(object):
         neighbors = self.protocol.router.findNeighbors(self.node)
         return [ tuple(n)[-2:] for n in neighbors ]
 
-    def bootstrap(self, addrs):
+    def bootstrap(self, addrs, seeds):
         """
         Bootstrap the server by connecting to other known nodes in the network.
 
         Args:
             addrs: A `list` of (ip, port) `tuple` pairs.  Note that only IP addresses
                    are acceptable - hostnames will cause an error.
+            seeds: A 'list' ssl seeds formatted as "hostname:port". We will try to bootstrap
+                   using addrs first an if that fails we will query the ssl seeds.
         """
+        def initTable(results):
+                nodes = []
+                for addr, result in results.items():
+                    if result[0]:
+                        nodes.append(Node(result[1], addr[0], addr[1]))
+                if len(nodes) < 1:
+                    return self.bootstrap([], seeds)
+                spider = NodeSpiderCrawl(self.protocol, self.node, nodes, self.ksize, self.alpha)
+                return spider.find()
+
         # if the transport hasn't been initialized yet, wait a second
         if self.protocol.transport is None:
-            return task.deferLater(reactor, 1, self.bootstrap, addrs)
+            return task.deferLater(reactor, 1, self.bootstrap, addrs, seeds)
 
-        def initTable(results):
-            nodes = []
-            for addr, result in results.items():
-                if result[0]:
-                    nodes.append(Node(result[1], addr[0], addr[1]))
-            spider = NodeSpiderCrawl(self.protocol, self.node, nodes, self.ksize, self.alpha)
-            return spider.find()
+        if len(addrs) > 0:
+            ds = {}
+            for addr in addrs:
+                ds[addr] = self.protocol.ping(addr, self.node.id)
+            return deferredDict(ds).addCallback(initTable)
+        else:
+            ds = {}
+            def formatResult(results):
+                tup_list = []
+                for s, nodes in results.items():
+                    tup_list.extend(nodes)
+                ds = {}
+                for addr in tup_list:
+                    ds[addr] = self.protocol.ping(addr, self.node.id)
+                return deferredDict(ds).addCallback(initTable)
 
-        ds = {}
-        for addr in addrs:
-            ds[addr] = self.protocol.ping(addr, self.node.id)
-        return deferredDict(ds).addCallback(initTable)
+            for seed in seeds:
+                ds[seed] = self.querySeed(seed)
+            return deferredDict(ds).addCallback(formatResult)
+
 
     def inetVisibleIP(self):
         """
@@ -140,41 +193,42 @@ class Server(object):
         if len(nearest) == 0:
             self.log.warning("There are no known neighbors to get key %s" % key)
             return defer.succeed(None)
-        elif len(key) != 40 or all(c in string.hexdigits for c in key) is not True:
+        elif len(key) != 64 or all(c in string.hexdigits for c in key) is not True:
             self.log.warning("Invalid key")
             return defer.succeed(None)
         spider = ValueSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
         return spider.find()
 
     def getRange(self):
-        def calculate_range(nodes):
-            high = long("0000000000000000000000000000000000000000", 16)
-            low = long("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF", 16)
-            for node in nodes:
-                if node.long_id > high:
-                    high = node.long_id
-                if node.long_id < low:
-                    low = node.long_id
-            return high - low
-
+        def calculate_range():
+            index = self.protocol.router.getBucketFor(self.node)
+            bucket = self.protocol.router.buckets[index]
+            return bucket.range[1] - bucket.range[0]
         nearest = self.protocol.router.findNeighbors(self.node)
         if len(nearest) == 0:
             self.log.warning("There are no known neighbors to get range")
             return False
-        heap = NodeHeap(self.node, self.ksize)
-        heap.push(nearest)
-        return calculate_range(list(heap))
+        else:
+            return calculate_range()
 
 
-    def set(self, key, value):
+    def send(self, key, value, store=True):
         """
         Set the given key to the given value in the network.
         """
         self.log.debug("setting '%s' = '%s' on network" % (key, value))
 
-        def store(nodes):
+        def set(nodes):
             self.log.info("setting '%s' on %s" % (key, map(str, nodes)))
-            ds = [self.protocol.callStore(node, key, value) for node in nodes]
+            if store:
+                ds = [self.protocol.callStore(node, key, value) for node in nodes]
+                keynode = Node(key)
+                ownBucket = self.protocol.router.buckets[self.protocol.router.getBucketFor(self.node)]
+                if ownBucket.hasInRange(keynode):
+                    self.log.debug("got a store request from %s, storing value" % str(self.node))
+                    self.storage[key] = value
+            else:
+                ds = [self.protocol.callRtc(node, key, value) for node in nodes]
             return defer.DeferredList(ds).addCallback(self._anyRespondSuccess)
 
         node = Node(key)
@@ -182,14 +236,11 @@ class Server(object):
         if len(nearest) == 0:
             self.log.warning("There are no known neighbors to set key %s" % key)
             return defer.succeed(False)
-        elif len(key) != 40 or all(c in string.hexdigits for c in key) is not True:
+        elif len(key) != 32:
             self.log.warning("Invalid key cannot set on network")
             return defer.succeed(None)
-        elif len(value) != 946 or all(c in string.hexdigits for c in key) is not True:
-            self.log.warning("Invalid message cannot set on network")
-            return defer.succeed(None)
-        spider = NodeSpiderCrawl(self.protocol, node, nearest, self.ksize, self.alpha)
-        return spider.find().addCallback(store)
+        spider = NodeSpiderCrawl(self.protocol, node, nearest, 40, self.alpha)
+        return spider.find().addCallback(set)
 
     def _anyRespondSuccess(self, responses):
         """
@@ -218,7 +269,7 @@ class Server(object):
             pickle.dump(data, f)
 
     @classmethod
-    def loadState(self, fname):
+    def loadState(self, fname, addrs, seeds):
         """
         Load the state of this node (the alpha/ksize/id/immediate neighbors)
         from a cache file with the given fname.
@@ -227,7 +278,8 @@ class Server(object):
             data = pickle.load(f)
         s = Server(data['ksize'], data['alpha'], data['id'])
         if len(data['neighbors']) > 0:
-            s.bootstrap(data['neighbors'])
+            data["neighbors"].extend(addrs)
+            s.bootstrap(data['neighbors'], seeds)
         return s
 
     def saveStateRegularly(self, fname, frequency=600):

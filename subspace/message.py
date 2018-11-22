@@ -1,14 +1,12 @@
 __author__ = 'chris'
 
 from bitcoin import *
+
 from subspace.pyelliptic import *
+from subspace import payload
+from subspace.utils import digest
 
-"""
-TODO: clean up this module. Plaintext will be serialized with protobuf including timestamp, sender pubkey,
-sender name, and hmac. Create a few methods for returning various parts of the object such as the serialized plaintext.
-And add some comments so people know what's going on.
-
-"""
+from pyelliptic.hash import hmac_sha256
 
 class MessageEncoder(object):
 
@@ -18,6 +16,7 @@ class MessageEncoder(object):
             recipient_pub: a hex encoded compressed public key
             sender_priv: a hex encoded private key
             message: the message as  string
+            range: the range the recipient's public key would fall within.
         """
 
         pub = decode_pubkey(recipient_pub, formt='hex_compressed')
@@ -25,109 +24,147 @@ class MessageEncoder(object):
         pubkey_raw = changebase(pubkey_hex[2:],16,256,minlen=64)
         self.pubkey_hex = recipient_pub
         self.pubkey = '\x02\xca\x00 '+pubkey_raw[:32]+'\x00 '+pubkey_raw[32:]
+        self.privkey_hex = sender_priv
         self.privkey = encode_privkey(sender_priv, "bin")
         self.message = message
-        self.ciphertext = ""
         self.length = 0
         self.range = range
+        pubkey = privkey_to_pubkey(sender_priv)
+        pubkey_raw = changebase(pubkey[2:],16,256,minlen=64)
+        pubkey = '\x02\xca\x00 '+pubkey_raw[:32]+'\x00 '+pubkey_raw[32:]
+        self.alice = ECC(curve="secp256k1", raw_privkey=self.privkey, pubkey=pubkey)
+        self.bob = ECC(curve='secp256k1', pubkey=self.pubkey)
+        self.shared_secret = self.alice.get_ecdh_key(self.pubkey)[:32]
 
-    def getblocks(self):
-        alice = ECC(curve="secp256k1", raw_privkey=self.privkey)
-        bob = ECC(curve='secp256k1', pubkey=self.pubkey)
-        self.ciphertext = binascii.hexlify(alice.encrypt(str(self.message), bob.get_pubkey()))
-        self.length = len(self.ciphertext) / 2
-        return self.create_header(self.split(self.ciphertext))
+    def split_and_encrypt(self):
+        messages = []
+        data = payload.MessageData()
+        data.messageID = digest(os.urandom(32))
+        data.sequence = 0
+        data.senderKey = encode_pubkey(privkey_to_pubkey(self.privkey_hex), "hex_compressed")
+        data.timeStamp = int(time.time())
+        data.unencryptedMessage = self.message
 
-    def split(self, ciphertext):
-        chunks = [ciphertext[i:i+946] for i in range(0, len(ciphertext), 946)]
-        for x in range(0, len(chunks)):
-            if len(chunks[x]) < 946:
-                n = (946 - len(chunks[x])) / 2
-                pad = os.urandom(n).encode('hex')
-                chunks[x] += pad
-        blocks = {}
-        for chunk in chunks:
-            hash = hash160(chunk)
-            blocks[hash] = chunk
-        return blocks
+        def pad():
+            pad_len = 500 - len(data.SerializeToString())
+            rand_pad = os.urandom(pad_len)
+            data.pad = rand_pad
+            excess = len(data.SerializeToString()) - 500
+            data.pad = rand_pad[excess:]
+            sign_message(data.SerializeToString())
 
-    def create_header(self, blocks):
-        pad = os.urandom(20).encode("hex")
-        num_blocks = hex(len(blocks))[2:].zfill(2)
-        len_ciphtertext = hex(self.length)[2:].zfill(4)
-        plaintext = num_blocks + len_ciphtertext
-        for key in blocks.keys():
-            plaintext += key
-        for i in range(0, 8-len(blocks)):
-            plaintext += pad
-        alice = ECC(privkey=self.privkey, curve="secp256k1")
-        bob = ECC(curve='secp256k1', pubkey=self.pubkey)
-        ciphertext = binascii.hexlify(alice.encrypt(plaintext, bob.get_pubkey()))
-        entropy = os.urandom(32).encode("hex")
-        nonce = 0
+        def sign_message(serialized_message):
+            hmac = hmac_sha256(self.shared_secret, serialized_message)
+            signed_payload = payload.SignedPayload()
+            signed_payload.serializedMessageData = serialized_message
+            signed_payload.HMac = hmac
+            messages.append(self.alice.encrypt(signed_payload.SerializeToString(), self.pubkey))
 
-        if self.range == 0:
-            ciphertext = ciphertext + hashlib.sha512(entropy + str(nonce)).hexdigest()[:50]
-            blocks[hash160(ciphertext)] = ciphertext
-            return blocks
-        else:
-            low = long(self.pubkey_hex[:40], 16) - self.range / 2
-            high = long(self.pubkey_hex[:40], 16) + self.range / 2
+        overage = 1
+        while overage > 0:
+            overage = len(data.SerializeToString()) - 500
+            if overage < 0:
+                pad()
+            elif overage == 0:
+                sign_message(data.SerializeToString())
+            elif overage > 0:
+                data.unencryptedMessage = self.message[:len(data.unencryptedMessage) - overage]
+                sign_message(data.SerializeToString())
+                self.message = self.message[len(data.unencryptedMessage):]
+                data.unencryptedMessage = self.message
+            data.sequence += 1
+        return messages
 
-            while True:
-                c = ciphertext + hashlib.sha512(entropy + str(nonce)).hexdigest()[:50]
-                hash = long(hash160(c), 16)
-                if low < hash < high:
-                    ciphertext = c
-                    break
-                nonce += 1
-            blocks[hash160(ciphertext)] = ciphertext
-            return blocks
+    def create_keys(self, ciphertexts):
+        """
+        We do some trivial brute forcing to get the hash of the message within the same range as the
+        recipient's public key
+        """
+        messages = {}
+        for ciphertext in ciphertexts:
+            entropy = os.urandom(32).encode("hex")
+            nonce = 0
+            if self.range == 0:
+                nonce_hash = digest(entropy + str(0))
+                message_hash = sha256(ciphertext + nonce_hash)
+                key = message_hash
+            else:
+                low = long(self.pubkey_hex[2:66], 16) - self.range / 4
+                high = long(self.pubkey_hex[2:66], 16) + self.range / 4
+                while True:
+                    nonce_hash = digest(entropy + str(nonce))
+                    message_hash = sha256(ciphertext + nonce_hash)
+                    long_hash = long(message_hash, 16)
+                    if low < long_hash < high:
+                        key = message_hash
+                        break
+                    nonce += 1
+            messages[key] = ciphertext + nonce_hash
+        return messages
+
+    def create_messages(self):
+        ciphertexts = self.split_and_encrypt()
+        messages = self.create_keys(ciphertexts)
+        return messages
 
 class MessageDecoder(object):
 
-    def __init__(self, private_key, kserver):
-        self.messageDic = kserver.storage.get_all()
-        self.privkey = private_key
-        self.kserver = kserver
-
-
-    def getMessages(self):
-        headers = {}
-        priv_bin = encode_privkey(self.privkey, "bin")
-        pubkey = privkey_to_pubkey(self.privkey)
+    def __init__(self, private_key, messageDic):
+        self.messageDic = messageDic
+        self.priv_bin = encode_privkey(private_key, "bin")
+        pubkey = privkey_to_pubkey(private_key)
         pubkey_raw = changebase(pubkey[2:],16,256,minlen=64)
         pubkey = '\x02\xca\x00 '+pubkey_raw[:32]+'\x00 '+pubkey_raw[32:]
-        bob = ECC(curve="secp256k1", raw_privkey=priv_bin, pubkey=pubkey)
+        self.bob = ECC(curve="secp256k1", raw_privkey=self.priv_bin, pubkey=pubkey)
+
+    def get_messages(self):
+        # First try to decrypt all the messages
+        messages = {}
         for k, v in self.messageDic.items():
-            full_message = v[1]
-            ciphertext = full_message[:896]
-            try:
-                headers[k] = bob.decrypt(binascii.unhexlify(ciphertext))
-            except:
-               None
-        messages = []
-        for k, v in headers.iteritems():
-            num_blocks = int(v[:2], 16)
-            len_c = int(v[2:6], 16) * 2
-            n = 6
-            blockids = []
-            for i in range(0, num_blocks):
-                blockids.append(v[n: n+40])
-                n = n + 40
-            cipherblocks = []
-            for blockid in blockids:
-                if self.messageDic.has_key(blockid):
-                    cipherblocks.append(self.messageDic[blockid])
+            # Don't bother attempting to decrypt if the hash doesn't match
+            if binascii.unhexlify(sha256(v[1])) == k:
+                ciphertext = v[1][:len(v[1]) - 20]
+                try:
+                    messages[k] = self.bob.decrypt(ciphertext)
+                except:
+                    None
+
+        # Parse each decrypted message and validate the hmac
+        spayload = payload.SignedPayload()
+        grouped_messages = {}
+        for signed_payload in messages.values():
+            spayload.ParseFromString(signed_payload)
+            data = payload.MessageData()
+            data.ParseFromString(spayload.serializedMessageData)
+
+            sender_pub = data.senderKey
+            pub = decode_pubkey(sender_pub, formt='hex_compressed')
+            pubkey_hex = encode_pubkey(pub, formt="hex")
+            pubkey_raw = changebase(pubkey_hex[2:],16,256,minlen=64)
+            pubkey = '\x02\xca\x00 '+pubkey_raw[:32]+'\x00 '+pubkey_raw[32:]
+
+            shared_secret = self.bob.get_ecdh_key(pubkey)[:32]
+            hmac = hmac_sha256(shared_secret, spayload.serializedMessageData)
+            # If the hmac is valid, group the messages by message ID
+            if hmac == spayload.HMac:
+                if data.messageID not in grouped_messages.keys():
+                    grouped_messages[data.messageID] = [data]
                 else:
-                    # this needs to be deffered
-                    cipherblocks.append(self.kserver.get(blockid))
-            ciphertext = ""
-            for block in cipherblocks:
-                ciphertext += block[1]
-            ciphertext = ciphertext[:len_c]
-            plaintext = bob.decrypt(binascii.unhexlify(ciphertext))
-            dict = {}
-            dict[k] = plaintext
-            messages.append(dict)
-        return messages
+                    mlist = grouped_messages[data.messageID]
+                    mlist.append(data)
+                    grouped_messages[data.messageID] = mlist
+        # Run through the grouped messages and reconstruct the plaintext in the proper order
+        reconstructed_messages = []
+        for message_list in grouped_messages.values():
+            m = {}
+            full_message = ""
+            for i in range(0, len(message_list)):
+                for data in message_list:
+                    if data.sequence == i:
+                        full_message += data.unencryptedMessage
+            m["sender"] = message_list[0].senderKey
+            m["timestamp"] = message_list[0].timeStamp
+            m["plaintext"] = full_message
+            reconstructed_messages.append(m)
+
+        return reconstructed_messages

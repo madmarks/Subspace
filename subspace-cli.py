@@ -3,6 +3,7 @@ __author__ = 'chris'
 import argparse
 import string
 import pickle
+import json
 
 from twisted.internet import reactor
 from txjsonrpc.netstring.jsonrpc import Proxy
@@ -17,7 +18,7 @@ def doContinue(value):
     pass
 
 def printValue(value):
-    print str(value)
+    print json.dumps(value, indent=4)
     reactor.stop()
 
 def printError(error):
@@ -34,7 +35,9 @@ class Parser(object):
     subspace <command> --help
 
 commands:
+    getinfo          returns an object containing various state info
     getmessages      returns a list of your messages in json format
+    getnew           returns messages that have not been previously returned by this command
     getprivkey       returns your private encryption key
     getpubkey        returns your node's public encryption key
     send             sends a message to the given public key
@@ -59,12 +62,19 @@ commands:
         parser.add_argument('-m', '--message', required=True,
                             help="the unencrypted message to send (will be encrypted)",
                             nargs='+')
+        parser.add_argument('-d', '--dontstore', action='store_true', help="sends to an online recipient without storing on the network")
         args = parser.parse_args(sys.argv[2:])
+        key = args.key
         if len(args.key) != 66 or all(c in string.hexdigits for c in args.key) is not True:
-            print "Invalid key. Enter a 33 byte public key in either hexadecimal for base58check format."
-            return
-
-        d = proxy.callRemote('send', args.key, args.message)
+            try:
+                key = b58check_to_hex(args.key)
+            except:
+                print "Invalid key. Enter a 33 byte public key in either hexadecimal for base58check format."
+                return
+        if args.dontstore:
+            d = proxy.callRemote('send', key, args.message, False)
+        else:
+            d = proxy.callRemote('send', key, args.message)
         d.addCallbacks(printValue, printError)
         reactor.run()
 
@@ -112,5 +122,25 @@ commands:
         d.addCallbacks(printKey, printError)
         reactor.run()
 
-proxy = Proxy('127.0.0.1', 7080)
+    def getnew(self):
+        parser = argparse.ArgumentParser(
+            description="Returns messages that have not previously been returned by this command",
+            usage='''usage:
+    subspace getnew''')
+        args = parser.parse_args(sys.argv[2:])
+        d = proxy.callRemote('getnew')
+        d.addCallbacks(printValue, printError)
+        reactor.run()
+
+    def getinfo(self):
+        parser = argparse.ArgumentParser(
+            description="Returns an object containing various state info",
+            usage='''usage:
+    subspace getinfo''')
+        args = parser.parse_args(sys.argv[2:])
+        d = proxy.callRemote('getinfo')
+        d.addCallbacks(printValue, printError)
+        reactor.run()
+
+proxy = Proxy('127.0.0.1', 8336)
 Parser(proxy)

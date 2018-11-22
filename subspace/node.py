@@ -7,10 +7,7 @@ class Node:
         self.id = id
         self.ip = ip
         self.port = port
-        if len(id) == 40:
-            self.long_id = long(id, 16)
-        else:
-            self.long_id = long(id.encode('hex'), 16)
+        self.long_id = long(id.encode('hex'), 16)
 
     def sameHomeAs(self, node):
         return self.ip == node.ip and self.port == node.port
@@ -97,8 +94,9 @@ class NodeHeap(object):
             nodes = [nodes]
 
         for node in nodes:
-            distance = self.node.distanceTo(node)
-            heapq.heappush(self.heap, (distance, node))
+            if node.id not in [n.id for n in self]:
+                distance = self.node.distanceTo(node)
+                heapq.heappush(self.heap, (distance, node))
 
     def __len__(self):
         return min(len(self.heap), self.maxsize)
